@@ -10,7 +10,7 @@ else
 fi
 
 # --- Load library ---
-LIBRARY_FILE="/srv/lib_common.sh"
+LIBRARY_FILE="./lib_common.sh"
 if [ -f "$LIBRARY_FILE" ]; then
     . "$LIBRARY_FILE"
 else
@@ -18,9 +18,8 @@ else
     exit 1
 fi
 
-
 # --- Настройки ---
-LOG="${LOG_FILE:-/var/log/smart_check.log}"
+LOG="${LOG_SMART_CHECK:-/var/log/smart_check.log}"
 START_TIME=$(date "+%Y-%m-%d %H:%M:%S")
 
 {
@@ -48,9 +47,23 @@ check_disk() {
         ["type"]="$disk_type"
         ["status"]="UNKNOWN"
         ["errors"]=""
+        ["wearout"]=""
     )
 
     local smart_data=$(sudo smartctl -H -A "$disk" 2>/dev/null)
+
+    if [[ "$disk_type" == "NVMe" || "$disk_type" == "SATA SSD" ]]; then
+        # Получаем процент износа для SSD/NVMe
+        if [[ "$SHOW_SSD_WEAROUT" == "1" ]]; then
+            if [[ "$disk_type" == "NVMe" ]]; then
+                result["wearout"]=$(echo "$smart_data" | grep -i "Percentage Used" | awk '{print $3}')
+            else
+                result["wearout"]=$(echo "$smart_data" | grep -i "Percent_Lifetime_Remain" | awk '{print 100 - $4}')
+            fi
+            # Если не нашли стандартный атрибут, пробуем альтернативные
+            [[ -z "${result["wearout"]}" ]] && result["wearout"]=$(echo "$smart_data" | grep -i "Wear_Leveling_Count" | awk '{print $4}')
+        fi
+    fi
 
     if [[ "$disk_type" == "NVMe" ]]; then
         result["status"]=$(echo "$smart_data" | grep -i "SMART overall-health" | awk '{print $NF}')
@@ -126,12 +139,13 @@ if [[ "$TELEGRAM_POST_MESSAGE_ALWAYS" == "1" || "$ERRORS_FOUND" == "1" ]]; then
 
         if [[ "${result[status]}" == "PASSED" ]]; then
             MESSAGE+="✅ <b>${result[type]}</b>: <code>${result[disk]}</code> (PASSED)%0A"
+            [[ -n "${result[wearout]}" ]] && MESSAGE+=" Износ: <code>${result[wearout]}%</code>%0A"
+            MESSAGE+="%0A%0A"
         else
             MESSAGE+="🔴 <b>${result[type]}</b>: <code>${result[disk]}</code> (${result[status]})%0A"
 
-            if [[ -n "${result[errors]}" ]]; then
-                MESSAGE+="<b>Errors</b>: <code>${result[errors]// /</code> <code>}</code>%0A"
-            fi
+            [[ -n "${result[wearout]}" ]] && MESSAGE+="Износ: <code>${result[wearout]}%</code>%0A"
+            [[ -n "${result[errors]}" ]] && MESSAGE+="<b>Errors</b>: <code>${result[errors]// /</code> <code>}</code>%0A"
             MESSAGE+="%0A"
         fi
     done
