@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- Загрузка конфига ---
-CONFIG_FILE="/srv/smart_monitor.conf"
+CONFIG_FILE="./smart_monitor.conf"
 if [ -f "$CONFIG_FILE" ]; then
     . "$CONFIG_FILE"
 else
@@ -48,20 +48,35 @@ check_disk() {
         ["status"]="UNKNOWN"
         ["errors"]=""
         ["wearout"]=""
+        ["written_gb"]=""
+        ["sector_size"]="512"
     )
 
     local smart_data=$(sudo smartctl -H -A "$disk" 2>/dev/null)
+    local smartctl_full=$(sudo smartctl --all "$disk" 2>/dev/null)
+
+    # Получаем размер сектора
+    result["sector_size"]=$(echo "$smartctl_full" | grep "Sector Size" | awk '{print $4}')
+    [[ -z "${result["sector_size"]}" ]] && result["sector_size"]="512"
 
     if [[ "$disk_type" == "NVMe" || "$disk_type" == "SATA SSD" ]]; then
-        # Получаем процент износа для SSD/NVMe
+        # Получаем процент износа
         if [[ "$SHOW_SSD_WEAROUT" == "1" ]]; then
             if [[ "$disk_type" == "NVMe" ]]; then
                 result["wearout"]=$(echo "$smart_data" | grep -i "Percentage Used" | awk '{print $3}')
             else
                 result["wearout"]=$(echo "$smart_data" | grep -i "Percent_Lifetime_Remain" | awk '{print 100 - $4}')
             fi
-            # Если не нашли стандартный атрибут, пробуем альтернативные
             [[ -z "${result["wearout"]}" ]] && result["wearout"]=$(echo "$smart_data" | grep -i "Wear_Leveling_Count" | awk '{print $4}')
+        fi
+
+        # Получаем записанные данные
+        if [[ "$SHOW_SSD_WRITTEN" == "1" ]]; then
+            local lbas_written=$(echo "$smart_data" | grep -i "Total_LBAs_Written" | awk '{print $10}')
+            if [[ -n "$lbas_written" ]]; then
+                local bytes_written=$((lbas_written * ${result["sector_size"]}))
+                result["written_gb"]=$(echo "scale=2; $bytes_written/1073741824" | bc)
+            fi
         fi
     fi
 
@@ -140,11 +155,13 @@ if [[ "$TELEGRAM_POST_MESSAGE_ALWAYS" == "1" || "$ERRORS_FOUND" == "1" ]]; then
         if [[ "${result[status]}" == "PASSED" ]]; then
             MESSAGE+="✅ <b>${result[type]}</b>: <code>${result[disk]}</code> (PASSED)%0A"
             [[ -n "${result[wearout]}" ]] && MESSAGE+=" Износ: <code>${result[wearout]}%</code>%0A"
+            [[ -n "${result[written_gb]}" ]] && MESSAGE+=" %0AЗаписано: <code>${result[written_gb]} GB</code>"
             MESSAGE+="%0A%0A"
         else
             MESSAGE+="🔴 <b>${result[type]}</b>: <code>${result[disk]}</code> (${result[status]})%0A"
 
             [[ -n "${result[wearout]}" ]] && MESSAGE+="Износ: <code>${result[wearout]}%</code>%0A"
+            [[ -n "${result[written_gb]}" ]] && MESSAGE+="Записано: <code>${result[written_gb]} GB</code>%0A"
             [[ -n "${result[errors]}" ]] && MESSAGE+="<b>Errors</b>: <code>${result[errors]// /</code> <code>}</code>%0A"
             MESSAGE+="%0A"
         fi
