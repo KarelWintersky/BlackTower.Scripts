@@ -1,0 +1,9 @@
+# Конфиг для BlackTower скриптов
+
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+TELEGRAM_POST_MESSAGE_ALWAYS=1  # Set to 0 to send only on errors
+
+LOG_SMART_CHECK="/var/log/smart_check.log"
+
+SHOW_SSD_WEAROUT=1  # 1 - показывать износ SSD, 0 - скрыть
