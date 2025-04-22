@@ -10,13 +10,22 @@ else
 fi
 
 # --- Load library ---
-LIBRARY_FILE="./lib_common.sh"
-if [ -f "$LIBRARY_FILE" ]; then
-    . "$LIBRARY_FILE"
+LIBRARY_FILE_COMMON="./lib_common.sh"
+if [ -f "$LIBRARY_FILE_COMMON" ]; then
+    . "$LIBRARY_FILE_COMMON"
 else
-    echo "Library file $LIBRARY_FILE not found!" >&2
+    echo "Library file $LIBRARY_FILE_COMMON not found!" >&2
     exit 1
 fi
+
+LIBRARY_FILE_SMART="./smart_lib.sh"
+if [ -f "$LIBRARY_FILE_SMART" ]; then
+    . "$LIBRARY_FILE_SMART"
+else
+    echo "Library file $LIBRARY_FILE_SMART not found!" >&2
+    exit 1
+fi
+
 
 # --- Настройки ---
 LOG="${LOG_SMART_CHECK:-/var/log/smart_check.log}"
@@ -53,50 +62,60 @@ check_disk() {
 
     local smartctl_full=$(sudo smartctl --all "$disk" 2>/dev/null)
 
+    # Проверяем на не поддерживаемые устройства
+    if echo "$smartctl_full" | grep -q "Unknown USB bridge"; then
+        echo "[$(date '+%H:%M:%S')] Пропускаем не поддерживаемое устройство: $disk (Unknown USB bridge)" >> "$LOG"
+        result["status"]="SKIPPED_UNSUPPORTED"
+        echo "$(declare -p result)"
+        return 0
+    fi
+
+    # Проверяем доступность SMART данных
+    if ! echo "$smartctl_full" | grep -q "SMART support is: Available"; then
+        echo "[$(date '+%H:%M:%S')] Пропускаем устройство без SMART: $disk" >> "$LOG"
+        result["status"]="SKIPPED_NO_SMART"
+        echo "$(declare -p result)"
+        return 0
+    fi
+
+    local smartctl_health=$(sudo smartctl --health "$disk" 2>/dev/null)
+    local smartctl_attributes=$(sudo smartctl --attributes "$disk" 2>/dev/null)
+
     result["sector_size"]=$(get_sector_size "$disk" "$smartctl_full")
 
     # Для NVMe используем отдельную логику
     if [[ "$disk_type" == "NVMe" ]]; then
         if [[ "$SHOW_SSD_WRITTEN" == "1" ]]; then
-            local raw_data=$(echo "$smartctl_full" | grep "Data Units Written" | awk '{print $4}')
-            local data_units=$(clean_number "$raw_data")
-
-            if [[ -n "$data_units" && "$data_units" =~ ^[0-9]+$ ]]; then
-              # 1 Data Unit = 1000 sectors (по спецификации NVMe)
-                local bytes_written=$((data_units * 1000 * ${result["sector_size"]}))
-                result["written_gb"]=$(echo "scale=2; $bytes_written/1073741824" | bc)
-            fi
+            result["written_gb"]=$(get_nvme_written "$disk_type" "${result["sector_size"]}" "$smartctl_full")
         fi
 
         if [[ "$SHOW_SSD_WEAROUT" == "1" ]]; then
-            result["wearout"]=$(echo "$smartctl_full" | grep "Percentage Used" | awk '{print $3}' | tr -d '%')
+            result["wearout"]=$(get_nvme_wearout "$smartctl_full")
         fi
     fi
 
     # Для SATA SSD
     if [[ "$disk_type" == "SATA SSD" ]]; then
         if [[ "$SHOW_SSD_WRITTEN" == "1" ]]; then
-            result["written_gb"]=$(get_ssd_written "$disk" "${result["sector_size"]}")
+            result["written_gb"]=$(get_ssd_written "$disk" "$smartctl_full" "${result["sector_size"]}" "$smartctl_full")
         fi
 
         if [[ "$SHOW_SSD_WEAROUT" == "1" ]]; then
-            result["wearout"]=$(echo "$smartctl_full" | grep "Percent_Lifetime_Remain" | awk '{print 100 - $4}')
-            [[ -z "${result["wearout"]}" ]] && result["wearout"]=$(echo "$smartctl_full" | grep "Wear_Leveling_Count" | awk '{print $4}')
+            result["wearout"]=$(get_ssd_wearout "$smartctl_full")
         fi
     fi
 
     # Проверка здоровья диска (основная проверка SMART)
-    local smart_health=$(sudo smartctl -H "$disk" 2>/dev/null)
     if [[ "$disk_type" == "NVMe" ]]; then
-        result["status"]=$(echo "$smart_health" | grep -i "SMART overall-health" | awk '{print $NF}')
+        result["status"]=$(echo "$smartctl_health" | grep -i "SMART overall-health" | awk '{print $NF}')
     else
-        result["status"]=$(echo "$smart_health" | grep -i "test result" | awk '{print $NF}')
+        result["status"]=$(echo "$smartctl_health" | grep -i "test result" | awk '{print $NF}')
     fi
 
     # Сбор ошибок (для HDD и SSD)
-    local smart_errors=$(sudo smartctl -A "$disk" 2>/dev/null)
+
     if [[ "$disk_type" != "NVMe" ]]; then
-        result["errors"]=$(echo "$smart_errors" | grep -E "Reallocated_Sector_Ct|Current_Pending_Sector|Uncorrectable_Error_Ct" | awk '$10 != "0" {print $2, $10}')
+        result["errors"]=$(echo "$smartctl_attributes" | grep -E "Reallocated_Sector_Ct|Current_Pending_Sector|Uncorrectable_Error_Ct" | awk '$10 != "0" {print $2, $10}')
     fi
 
     echo "$(declare -p result)"
@@ -106,14 +125,14 @@ check_disk() {
 declare -a ALL_RESULTS
 ERRORS_FOUND=0
 
-#{
-#    echo "--- Проверка дисков ---"
-#    echo "Типы дисков:"
-#    echo "HDD: $DISKS_HDD"
-#    echo "SATA SSD: $DISKS_SSD"
-#    echo "NVMe: $DISKS_NVME"
-#    echo ""
-#} >> "$LOG"
+{
+    echo "--- Проверка дисков ---"
+    echo "Типы дисков:"
+    echo "HDD: $DISKS_HDD"
+    echo "SATA SSD: $DISKS_SSD"
+    echo "NVMe: $DISKS_NVME"
+    echo ""
+} >> "$LOG"
 
 for disk in $DISKS_HDD $DISKS_SSD $DISKS_NVME; do
     if [[ "$DISKS_HDD" == *"$disk"* ]]; then
@@ -123,8 +142,14 @@ for disk in $DISKS_HDD $DISKS_SSD $DISKS_NVME; do
     else
         disk_type="NVMe"
     fi
-    
-    eval "$(check_disk "$disk" "$disk_type")"
+
+    disk_result=$(check_disk "$disk" "$disk_type")
+    eval "$disk_result"
+
+    # Пропускаем не поддерживаемые диски
+    if [[ "${result[status]}" == "SKIPPED_UNSUPPORTED" || "${result[status]}" == "SKIPPED_NO_SMART" ]]; then
+        continue
+    fi
     
     # Человеко-читаемый лог
     {
@@ -165,8 +190,6 @@ if [[ "$TELEGRAM_POST_MESSAGE_ALWAYS" == "1" || "$ERRORS_FOUND" == "1" ]]; then
     # Отправляем в Telegram
     TELEGRAM_STATUS=$(send_to_telegram "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$MESSAGE")
 fi
-
-
 
 # --- Финальный лог ---
 {
