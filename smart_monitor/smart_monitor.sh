@@ -49,61 +49,56 @@ check_disk() {
         ["errors"]=""
         ["wearout"]=""
         ["written_gb"]=""
-        ["sector_size"]="512"
     )
 
-    local smart_data=$(sudo smartctl -H -A "$disk" 2>/dev/null)
     local smartctl_full=$(sudo smartctl --all "$disk" 2>/dev/null)
 
-    # Получаем размер сектора
-    result["sector_size"]=$(echo "$smartctl_full" | grep "Sector Size" | awk '{print $4}')
-    [[ -z "${result["sector_size"]}" ]] && result["sector_size"]="512"
+    result["sector_size"]=$(get_sector_size "$disk" "$smartctl_full")
 
-    if [[ "$disk_type" == "NVMe" || "$disk_type" == "SATA SSD" ]]; then
-        # Получаем процент износа
-        if [[ "$SHOW_SSD_WEAROUT" == "1" ]]; then
-            if [[ "$disk_type" == "NVMe" ]]; then
-                result["wearout"]=$(echo "$smart_data" | grep -i "Percentage Used" | awk '{print $3}')
-            else
-                result["wearout"]=$(echo "$smart_data" | grep -i "Percent_Lifetime_Remain" | awk '{print 100 - $4}')
-            fi
-            [[ -z "${result["wearout"]}" ]] && result["wearout"]=$(echo "$smart_data" | grep -i "Wear_Leveling_Count" | awk '{print $4}')
-        fi
-
-        # Получаем записанные данные
+    # Для NVMe используем отдельную логику
+    if [[ "$disk_type" == "NVMe" ]]; then
         if [[ "$SHOW_SSD_WRITTEN" == "1" ]]; then
-            local lbas_written=$(echo "$smart_data" | grep -i "Total_LBAs_Written" | awk '{print $10}')
-            if [[ -n "$lbas_written" ]]; then
-                local bytes_written=$((lbas_written * ${result["sector_size"]}))
+            local raw_data=$(echo "$smartctl_full" | grep "Data Units Written" | awk '{print $4}')
+            local data_units=$(clean_number "$raw_data")
+
+            if [[ -n "$data_units" && "$data_units" =~ ^[0-9]+$ ]]; then
+              # 1 Data Unit = 1000 sectors (по спецификации NVMe)
+                local bytes_written=$((data_units * 1000 * ${result["sector_size"]}))
                 result["written_gb"]=$(echo "scale=2; $bytes_written/1073741824" | bc)
             fi
         fi
+
+        if [[ "$SHOW_SSD_WEAROUT" == "1" ]]; then
+            result["wearout"]=$(echo "$smartctl_full" | grep "Percentage Used" | awk '{print $3}' | tr -d '%')
+        fi
     fi
 
+    # Для SATA SSD
+    if [[ "$disk_type" == "SATA SSD" ]]; then
+        if [[ "$SHOW_SSD_WRITTEN" == "1" ]]; then
+            result["written_gb"]=$(get_ssd_written "$disk" "${result["sector_size"]}")
+        fi
+
+        if [[ "$SHOW_SSD_WEAROUT" == "1" ]]; then
+            result["wearout"]=$(echo "$smartctl_full" | grep "Percent_Lifetime_Remain" | awk '{print 100 - $4}')
+            [[ -z "${result["wearout"]}" ]] && result["wearout"]=$(echo "$smartctl_full" | grep "Wear_Leveling_Count" | awk '{print $4}')
+        fi
+    fi
+
+    # Проверка здоровья диска (основная проверка SMART)
+    local smart_health=$(sudo smartctl -H "$disk" 2>/dev/null)
     if [[ "$disk_type" == "NVMe" ]]; then
-        result["status"]=$(echo "$smart_data" | grep -i "SMART overall-health" | awk '{print $NF}')
-        
-        # NVMe-специфичные атрибуты
-        result["media_errors"]=$(echo "$smart_data" | grep -i "Media and Data Integrity Errors" | awk '{print $NF}')
-        result["log_errors"]=$(echo "$smart_data" | grep -i "Error Information Log Entries" | awk '{print $NF}')
-        
-        [[ "${result["media_errors"]}" =~ ^[0-9]+$ ]] || result["media_errors"]=0
-        [[ "${result["log_errors"]}" =~ ^[0-9]+$ ]] || result["log_errors"]=0
-        
-        [ "${result["media_errors"]}" -ne 0 ] && result["errors"]+="Media Errors: ${result["media_errors"]} "
-        [ "${result["log_errors"]}" -ne 0 ] && result["errors"]+="Log Errors: ${result["log_errors"]} "
+        result["status"]=$(echo "$smart_health" | grep -i "SMART overall-health" | awk '{print $NF}')
     else
-        result["status"]=$(echo "$smart_data" | grep -i "test result" | awk '{print $NF}')
-        
-        # Атрибуты для HDD/SATA SSD
-        while read -r line; do
-            key=$(echo "$line" | awk '{print $1}')
-            value=$(echo "$line" | awk '{print $10}')
-            [ "$value" != "0" ] && result["errors"]+="$key=$value "
-        done <<< "$(echo "$smart_data" | grep -E "Reallocated_Sector_Ct|Current_Pending_Sector|Uncorrectable_Error_Ct")"
+        result["status"]=$(echo "$smart_health" | grep -i "test result" | awk '{print $NF}')
     fi
 
-    result["errors"]="${result["errors"]% }"
+    # Сбор ошибок (для HDD и SSD)
+    local smart_errors=$(sudo smartctl -A "$disk" 2>/dev/null)
+    if [[ "$disk_type" != "NVMe" ]]; then
+        result["errors"]=$(echo "$smart_errors" | grep -E "Reallocated_Sector_Ct|Current_Pending_Sector|Uncorrectable_Error_Ct" | awk '$10 != "0" {print $2, $10}')
+    fi
+
     echo "$(declare -p result)"
 }
 
