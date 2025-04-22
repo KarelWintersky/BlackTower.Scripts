@@ -60,7 +60,8 @@ check_disk() {
         ["written_gb"]=""
     )
 
-    local smartctl_full=$(sudo smartctl --all "$disk" 2>/dev/null)
+    local smartctl_full
+    smartctl_full=$(sudo smartctl --all "$disk" 2>/dev/null)
 
     # Проверяем на не поддерживаемые устройства
     if echo "$smartctl_full" | grep -q "Unknown USB bridge"; then
@@ -70,9 +71,8 @@ check_disk() {
         return 0
     fi
 
-    # Проверяем доступность SMART данных
-    if ! echo "$smartctl_full" | grep -q "SMART support is: Available"; then
-        echo "[$(date '+%H:%M:%S')] Пропускаем устройство без SMART: $disk" >> "$LOG"
+    # Проверяем доступность SMART (разные проверки для NVMe и других)
+    if ! check_smart_available "$disk" "$disk_type" "$smartctl_full"; then
         result["status"]="SKIPPED_NO_SMART"
         echo "$(declare -p result)"
         return 0
@@ -113,7 +113,6 @@ check_disk() {
     fi
 
     # Сбор ошибок (для HDD и SSD)
-
     if [[ "$disk_type" != "NVMe" ]]; then
         result["errors"]=$(echo "$smartctl_attributes" | grep -E "Reallocated_Sector_Ct|Current_Pending_Sector|Uncorrectable_Error_Ct" | awk '$10 != "0" {print $2, $10}')
     fi
@@ -175,8 +174,8 @@ if [[ "$TELEGRAM_POST_MESSAGE_ALWAYS" == "1" || "$ERRORS_FOUND" == "1" ]]; then
         if [[ "${result[status]}" == "PASSED" ]]; then
             MESSAGE+="✅ <b>${result[type]}</b>: <code>${result[disk]}</code> (PASSED)%0A"
             [[ -n "${result[wearout]}" ]] && MESSAGE+=" Износ: <code>${result[wearout]}%</code>%0A"
-            [[ -n "${result[written_gb]}" ]] && MESSAGE+=" %0AЗаписано: <code>${result[written_gb]} GB</code>"
-            MESSAGE+="%0A%0A"
+            [[ -n "${result[written_gb]}" ]] && MESSAGE+=" Записано: <code>${result[written_gb]} GB</code>%0A"
+            MESSAGE+="%0A"
         else
             MESSAGE+="🔴 <b>${result[type]}</b>: <code>${result[disk]}</code> (${result[status]})%0A"
 

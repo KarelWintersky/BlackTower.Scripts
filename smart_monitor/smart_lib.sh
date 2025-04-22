@@ -1,5 +1,29 @@
 #!/bin/bash
 
+check_smart_available() {
+    local disk="$1"
+    local disk_type="$2"
+    local smart_data="$3"
+
+    if [[ "$disk_type" == "NVMe" ]]; then
+        # Для NVMe проверяем наличие строки SMART overall-health
+        if echo "$smart_data" | grep -q "SMART overall-health"; then
+            return 0
+        else
+            echo "[$(date '+%H:%M:%S')] NVMe диск не поддерживает SMART: $disk" >> "$LOG"
+            return 1
+        fi
+    else
+        # Для SATA/HDD проверяем стандартную строку
+        if echo "$smart_data" | grep -q "SMART support is: Available"; then
+            return 0
+        else
+            echo "[$(date '+%H:%M:%S')] Диск без поддержки SMART: $disk" >> "$LOG"
+            return 1
+        fi
+    fi
+}
+
 #
 # Вычисляет размер сектора на диске
 # 1: /dev/xxx
@@ -108,7 +132,8 @@ get_nvme_wearout() {
     ' | head -1)
 
     # Очищаем от возможных нецифровых символов
-    local cleaned=$(echo "$raw_value" | tr -d '% ' | sed 's/[^0-9]//g')
+    # local cleaned=$(echo "$raw_value" | tr -d '% ' | sed 's/[^0-9]//g')
+    local cleaned=$(echo "$raw_value" | sed -E 's/[^0-9]//g; s/^0+([0-9])/\1/')
 
     # Проверяем валидность
     if [[ -z "$cleaned" ]]; then
@@ -128,12 +153,14 @@ get_nvme_wearout() {
 # Вычисляем износ SSD
 # 1: smartctl --all
 #
-get_ssd_wearout() {
+get_ssd_wearout_() {
     local smart_data="$1"
     local wearout="N/A"
 
     # Пробуем получить Percent_Lifetime_Remain (обратный расчет: 100 - значение)
-    local lifetime_remain=$(echo "$smart_data" | awk '/Percent_Lifetime_Remain/{print $4}')
+    local raw_value=$(echo "$smart_data" | awk '/Percent_Lifetime_Remain/{print $4}')
+    local lifetime_remain=$(echo "$raw_value" | sed -E 's/[^0-9]//g; s/^0+([0-9])/\1/')
+
     if [[ -n "$lifetime_remain" && "$lifetime_remain" =~ ^[0-9]+$ ]]; then
         wearout=$((100 - lifetime_remain))
     else
@@ -149,4 +176,29 @@ get_ssd_wearout() {
         echo "N/A"
         return 1
     fi
+}
+
+get_ssd_wearout() {
+    local smart_data="$1"
+
+    # Пробуем получить Percent_Lifetime_Remain
+    local raw_value=$(echo "$smart_data" | awk '/Percent_Lifetime_Remain/{print $4}')
+    lifetime_remain=$(echo "$raw_value" | sed -E 's/[^0-9]//g; s/^0+([0-9])/\1/')
+
+    if [[ -n "$lifetime_remain" && "$lifetime_remain" =~ ^[0-9]+$ ]]; then
+        local wearout=$((100 - $lifetime_remain))
+        log_immediately "$wearout"
+        (( wearout >= 0 && wearout <= 100 )) && echo "$wearout" && return 0
+    fi
+
+    # Пробуем получить Wear_Leveling_Count
+    raw_value=$(echo "$smart_data" | awk '/Wear_Leveling_Count/{print $4}')
+    wlc=$(echo "$raw_value" | sed -E 's/[^0-9]//g; s/^0+([0-9])/\1/')
+    if [[ -n "$wlc" && "$wlc" =~ ^0*[0-9]+$ ]]; then
+        wlc=$((100 - $wlc))
+        (( 10#$wlc >= 0 && 10#$wlc <= 100 )) && echo "$((10#$wlc))" && return 0
+    fi
+
+    echo "N/A"
+    return 1
 }
